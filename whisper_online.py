@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 import sys
 import numpy as np
@@ -49,7 +50,7 @@ class ASRBase:
     def transcribe(self, audio, init_prompt=""):
         raise NotImplemented("must be implemented in the child class")
 
-    def use_vad(self):
+    def use_vad(self, vad_parameters=None):
         raise NotImplemented("must be implemented in the child class")
 
 
@@ -88,7 +89,7 @@ class WhisperTimestampedASR(ASRBase):
     def segments_end_ts(self, res):
         return [s["end"] for s in res["segments"]]
 
-    def use_vad(self):
+    def use_vad(self, vad_parameters=None):
         self.transcribe_kargs["vad"] = True
 
     def set_translate_task(self):
@@ -116,7 +117,7 @@ class FasterWhisperASR(ASRBase):
 
 
         # this worked fast and reliably on NVIDIA L40
-        model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
+        # model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
 
         # or run on GPU with INT8
         # tested: the transcripts were different, probably worse than with FP16, and it was slightly (appx 20%) slower
@@ -124,13 +125,13 @@ class FasterWhisperASR(ASRBase):
 
         # or run on CPU with INT8
         # tested: works, but slow, appx 10-times than cuda FP16
-#        model = WhisperModel(modelsize, device="cpu", compute_type="int8") #, download_root="faster-disk-cache-dir/")
+        model = WhisperModel(modelsize, device="cpu", compute_type="int8") #, download_root="faster-disk-cache-dir/")
         return model
 
     def transcribe(self, audio, init_prompt=""):
 
-        # tested: beam_size=5 is faster and better than 1 (on one 200 second document from En ESIC, min chunk 0.01)
-        segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=5, word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
+        # tested: beam_size=int(os.getenv('FWS_BEAM_SIZE','1')) is faster and better than 1 (on one 200 second document from En ESIC, min chunk 0.01)
+        segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=int(os.getenv('FWS_BEAM_SIZE','1')), word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
         #print(info)  # info contains language detection result
 
         return list(segments)
@@ -150,8 +151,20 @@ class FasterWhisperASR(ASRBase):
     def segments_end_ts(self, res):
         return [s.end for s in res]
 
-    def use_vad(self):
+    def use_vad(self, vad_parameters=None):
         self.transcribe_kargs["vad_filter"] = True
+        # Pass through supported faster-whisper VAD parameters when provided
+        if vad_parameters:
+            supported_keys = {
+                "threshold",
+                "min_silence_duration_ms",
+                "min_speech_duration_ms",
+                "speech_pad_ms",
+                "max_speech_duration_s",
+            }
+            sanitized = {k: v for k, v in vad_parameters.items() if (v is not None and k in supported_keys)}
+            if sanitized:
+                self.transcribe_kargs["vad_parameters"] = sanitized
 
     def set_translate_task(self):
         self.transcribe_kargs["task"] = "translate"
@@ -262,7 +275,8 @@ class MLXWhisper(ASRBase):
     def segments_end_ts(self, res):
         return [s['end'] for s in res]
 
-    def use_vad(self):
+    def use_vad(self, vad_parameters=None):
+        # MLX Whisper may not support VAD; keep for API parity and ignore params
         self.transcribe_kargs["vad_filter"] = True
 
     def set_translate_task(self):
@@ -347,7 +361,8 @@ class OpenaiApiASR(ASRBase):
 
         return transcript
 
-    def use_vad(self):
+    def use_vad(self, vad_parameters=None):
+        # OpenAI API: emulate VAD by skipping words in high no_speech segments
         self.use_vad_opt = True
 
     def set_translate_task(self):
@@ -634,7 +649,7 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
     When it detects end of speech (non-voice for 500ms), it makes OnlineASRProcessor to end the utterance immediately.
     '''
 
-    def __init__(self, online_chunk_size, *a, **kw):
+    def __init__(self, online_chunk_size, *a, vad_parameters=None, **kw):
         self.online_chunk_size = online_chunk_size
 
         self.online = OnlineASRProcessor(*a, **kw)
@@ -646,7 +661,15 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
             model='silero_vad'
         )
         from silero_vad_iterator import FixedVADIterator
-        self.vac = FixedVADIterator(model)  # we use the default options there: 500ms silence, 100ms padding, etc.  
+        # Configure VAC (silero) with provided VAD parameters when available
+        params = vad_parameters or {}
+        self.vac = FixedVADIterator(
+            model,
+            threshold=params.get('threshold', 0.5),
+            sampling_rate=self.SAMPLING_RATE,
+            min_silence_duration_ms=params.get('min_silence_duration_ms', 500),
+            speech_pad_ms=params.get('speech_pad_ms', 100)
+        )
 
         self.logfile = self.online.logfile
         self.init()
@@ -774,7 +797,13 @@ def add_shared_args(parser):
     parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api"],help='Load only this backend for Whisper processing.')
     parser.add_argument('--vac', action="store_true", default=False, help='Use VAC = voice activity controller. Recommended. Requires torch.')
     parser.add_argument('--vac-chunk-size', type=float, default=0.04, help='VAC sample size in seconds.')
-    parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
+    parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection. When set, you can tune VAD parameters below.')
+    # VAD parameters (forwarded to backend when supported, e.g., faster-whisper vad_parameters)
+    parser.add_argument('--threshold', type=float, default=None, help='VAD speech probability threshold (e.g., 0.5).')
+    parser.add_argument('--min_silence_duration_ms', type=int, default=None, help='Wait this long (ms) of silence to end speech.')
+    parser.add_argument('--min_speech_duration_ms', type=int, default=None, help='Minimum speech duration (ms) to consider a segment.')
+    parser.add_argument('--speech_pad_ms', type=int, default=None, help='Pad final speech segments by this many ms on each side.')
+    parser.add_argument('--max_speech_duration_s', type=float, default=None, help='Force split long speech segments at this length (seconds). Helps finalize long sentences sooner.')
     parser.add_argument('--buffer_trimming', type=str, default="segment", choices=["sentence", "segment"],help='Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter must be installed for "sentence" option.')
     parser.add_argument('--buffer_trimming_sec', type=float, default=15, help='Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.')
     parser.add_argument("-l", "--log-level", dest="log_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Set the log level", default='DEBUG')
@@ -806,7 +835,14 @@ def asr_factory(args, logfile=sys.stderr):
     # Apply common configurations
     if getattr(args, 'vad', False):  # Checks if VAD argument is present and True
         logger.info("Setting VAD filter")
-        asr.use_vad()
+        vad_parameters = {
+            'threshold': getattr(args, 'threshold', None),
+            'min_silence_duration_ms': getattr(args, 'min_silence_duration_ms', None),
+            'min_speech_duration_ms': getattr(args, 'min_speech_duration_ms', None),
+            'speech_pad_ms': getattr(args, 'speech_pad_ms', None),
+            'max_speech_duration_s': getattr(args, 'max_speech_duration_s', None),
+        }
+        asr.use_vad(vad_parameters=vad_parameters)
 
     language = args.lan
     if args.task == "translate":
@@ -823,8 +859,22 @@ def asr_factory(args, logfile=sys.stderr):
 
     # Create the OnlineASRProcessor
     if args.vac:
-        
-        online = VACOnlineASRProcessor(args.min_chunk_size, asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+        # Pass VAD-like parameters into VAC end-of-utterance detector as well
+        vac_params = {
+            'threshold': getattr(args, 'threshold', None),
+            'min_silence_duration_ms': getattr(args, 'min_silence_duration_ms', None),
+            'speech_pad_ms': getattr(args, 'speech_pad_ms', None),
+        }
+        # remove None to keep silero defaults when not set
+        vac_params = {k: v for k, v in vac_params.items() if v is not None}
+        online = VACOnlineASRProcessor(
+            args.min_chunk_size,
+            asr,
+            tokenizer,
+            logfile=logfile,
+            buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec),
+            vad_parameters=vac_params or None,
+        )
     else:
         online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
 
